@@ -19,7 +19,7 @@
         "decorations": false,
         "resizable": true,
         "maximized": true,
-        "transparent": true,
+        "transparent": false,
         "minWidth": 800,
         "minHeight": 600,
         "dragDropEnabled": false,
@@ -42,6 +42,7 @@
       "icons/icon.png"
     ],
     "windows": {
+      "webviewInstallMode": { "type": "embedBootstrapper" },
       "wix": {
         "language": "zh-CN"
       },

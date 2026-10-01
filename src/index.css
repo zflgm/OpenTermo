@@ -32,7 +32,13 @@
 }
 
 /* ━━━━━ Base Reset ━━━━━ */
-html { font-size: 18px; }
+/* Opaque base on `html` (the window is no longer transparent — see
+   tauri.conf.json), so a non-transparent window never flashes white. It sits
+   on `html`, not `body`: `body::before` paints the wallpaper at z-index -1,
+   which an opaque `body` background would cover. The theme's only base token,
+   `--bg-base`, is a translucent rgba (dark default alpha 0.2) and so cannot
+   serve as an opaque base, hence the literal. */
+html { font-size: 18px; background: #131313; }
 html, body, #root {
   height: 100%;
   margin: 0;
