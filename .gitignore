@@ -1,7 +1,6 @@
 /target
 meatshell/target/
 **/*.rs.bk
-Cargo.lock
 node_modules/
 dist/
 .trae/
