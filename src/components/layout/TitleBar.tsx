@@ -1,0 +1,305 @@
+import { useCallback, useState, useEffect } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Minus, Square, X, Copy, HardDrive, HardDriveUpload, Settings, Loader2, Palette, Plus, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { useSessionStore } from "@/stores/sessionStore";
+import { rclone_mount, rclone_unmount, rclone_list } from "@/lib/tauriCommands";
+import { useUIStore } from "@/stores/uiStore";
+import { useSettingsStore, THEME_ORDER, THEME_LABELS } from "@/stores/settingsStore";
+
+interface TitleBarProps {
+  onSettings: () => void;
+}
+
+export default function TitleBar({ onSettings }: TitleBarProps) {
+  const tabs = useSessionStore((s) => s.tabs);
+  const activeTabId = useSessionStore((s) => s.activeTabId);
+  const setActiveTab = useSessionStore((s) => s.setActiveTab);
+  const disconnect = useSessionStore((s) => s.disconnect);
+  const setError = useSessionStore((s) => s.setError);
+  const clearError = useSessionStore((s) => s.clearError);
+  const setInfo = useSessionStore((s) => s.setInfo);
+  const toggleSidebar = useUIStore((s) => s.toggleSidebar);
+  const isSidebarOpen = useUIStore((s) => s.isSidebarOpen);
+  const openLauncher = useUIStore((s) => s.openLauncher);
+  const theme = useSettingsStore((s) => s.theme);
+  const setTheme = useSettingsStore((s) => s.setTheme);
+
+  const nextTheme = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
+  const toggleTheme = useCallback(() => {
+    setTheme(nextTheme);
+  }, [nextTheme, setTheme]);
+
+  const themeIcon = theme === "light"
+    ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></svg>
+    : theme === "custom"
+    ? <Palette size={14} />
+    : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>;
+  // tabId -> drive letter (e.g. "M:")
+  const [mounts, setMounts] = useState<Record<string, string>>({});
+  // Mount/unmount takes 2-3s; without this the button looks inert and a second
+  // click only earns an "Already mounted" error.
+  const [busy, setBusy] = useState<null | "mount" | "unmount">(null);
+
+  // Poll mounts from backend
+  const refreshMounts = useCallback(async () => {
+    try {
+      const list = await rclone_list();
+      const map: Record<string, string> = {};
+      for (const m of list) map[m.tabId] = m.drive;
+      setMounts(map);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    refreshMounts();
+    const id = setInterval(refreshMounts, 3000);
+    return () => clearInterval(id);
+  }, [refreshMounts]);
+
+  const activeTab = tabs.find((t) => t.id === activeTabId);
+  const isSSH = activeTab?.session?.kind === "ssh" && activeTab?.status === "connected";
+
+  // 最大化按钮原来恒定画方框，看不出窗口当前是最大化还是还原态。窗口现在是启动
+  // 即最大化，这个失真就更明显。改成跟着窗口状态走：拖动边框缩放、双击标题栏、
+  // 热键都会触发 onResized，所以订阅它而不是只在点击时更新。
+  const [maximized, setMaximized] = useState(false);
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const sync = () => {
+      win.isMaximized().then((v) => { if (!disposed) setMaximized(v); }).catch(() => {});
+    };
+    sync();
+    win.onResized(sync).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    }).catch(() => {});
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
+  const minimize = useCallback(() => getCurrentWindow().minimize(), []);
+  const toggleMaximize = useCallback(() => getCurrentWindow().toggleMaximize(), []);
+  const close = useCallback(() => getCurrentWindow().close(), []);
+
+  const currentDrive = activeTabId ? mounts[activeTabId] : null;
+
+  const handleMount = useCallback(async () => {
+    if (!activeTabId || busy) return;
+    clearError();
+    setBusy("mount");
+    try {
+      const res = await rclone_mount(activeTabId);
+      setInfo(`已挂载到 ${res.split(" -> ")[0]}`);
+    } catch (e: any) {
+      setError("[SSHFS 挂载] " + (e?.toString?.() || String(e)));
+    } finally {
+      setBusy(null);
+      refreshMounts();
+    }
+  }, [activeTabId, busy, clearError, setError, setInfo, refreshMounts]);
+
+  const handleUnmount = useCallback(async () => {
+    if (!activeTabId || busy) return;
+    const drive = currentDrive;
+    clearError();
+    setBusy("unmount");
+    try {
+      await rclone_unmount(activeTabId);
+      setInfo(`已卸载 ${drive}`);
+    } catch (e: any) {
+      setError("[SSHFS 卸载] " + (e?.toString?.() || String(e)));
+    } finally {
+      setBusy(null);
+      refreshMounts();
+    }
+  }, [activeTabId, busy, currentDrive, clearError, setError, setInfo, refreshMounts]);
+
+  return (
+    <header
+      data-tauri-drag-region
+      className="flex h-11 items-center bg-[var(--bg-glass)] backdrop-blur-[var(--glass-blur,18px)] frame-edge-b select-none flex-shrink-0"
+    >
+      {/* Logo + app name */}
+      <div className="flex items-center gap-2.5 pl-4 pr-2 flex-shrink-0 no-drag">
+        <svg viewBox="0 0 64 64" className="w-7 h-7 rounded-lg flex-shrink-0" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="logo-bg" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stopColor="#1a1a1a"/>
+              <stop offset="100%" stopColor="#0a0a0a"/>
+            </linearGradient>
+          </defs>
+          <rect width="64" height="64" rx="16" fill="url(#logo-bg)"/>
+          <text x="8" y="45" fontFamily="Arial Black, system-ui, sans-serif" fontSize="36" fontWeight="900" fill="#fff">&gt;_</text>
+          <rect x="47" y="17" width="4" height="24" rx="2" fill="#4ade80">
+            <animate attributeName="opacity" values="1;0;1" dur="1s" repeatCount="indefinite"/>
+          </rect>
+        </svg>
+        <span className="text-xs font-semibold text-[var(--text-secondary)] tracking-wide">
+          OpenTermo
+        </span>
+      </div>
+
+      {/* 侧栏开关：原来挂在 Logo 上，既没有可点击的暗示，收起后也只能靠猜。
+          现在给它一个独立按钮，图标随开合两态变化。 */}
+      <button
+        onClick={toggleSidebar}
+        onMouseDown={(e) => e.stopPropagation()}
+        className="no-drag flex items-center justify-center w-9 h-8 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--surface-hover)] transition-colors flex-shrink-0"
+        title={isSidebarOpen ? "收起侧栏" : "展开侧栏"}
+        aria-label={isSidebarOpen ? "收起侧栏" : "展开侧栏"}
+      >
+        {isSidebarOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
+      </button>
+
+      {/* Tabs — pill style */}
+      <div className="flex items-center flex-1 overflow-hidden h-full gap-1.5 px-1">
+        {tabs.map((tab) => {
+          const isActive = tab.id === activeTabId;
+          return (
+            <div
+              key={tab.id}
+              onClick={(e) => { e.stopPropagation(); setActiveTab(tab.id); }}
+              // X11 约定：中键点标签页 = 关闭它
+              onAuxClick={(e) => {
+                if (e.button !== 1) return;
+                e.stopPropagation();
+                disconnect(tab.id);
+              }}
+              onMouseDown={(e) => {
+                e.stopPropagation();
+                // 中键在 WebView 里会触发自动滚动，压掉它
+                if (e.button === 1) e.preventDefault();
+              }}
+              title={`${tab.session.name || tab.session.host}（中键关闭）`}
+              className={`no-drag group relative flex items-center gap-1.5 h-8 px-3 text-xs cursor-pointer rounded-md transition-all duration-200 ${
+                tab.status === "connecting"
+                  ? "bg-warning/[0.08] border border-warning/30 text-warning"
+                  : isActive
+                    ? "bg-[var(--tab-active-bg)] border border-[var(--tab-active-border)] text-[var(--text-primary)] font-semibold"
+                    : "border border-transparent text-[var(--text-secondary)] hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]"
+              }`}
+            >
+              {/* Status dot */}
+              <span
+                className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                  tab.status === "connecting"
+                    ? "bg-[var(--color-warning)] shadow-[0_0_6px_var(--color-warning)] animate-pulse"
+                    : tab.status === "connected"
+                      ? "bg-[var(--color-success)] shadow-[0_0_6px_var(--color-success)]"
+                      : "bg-[var(--color-danger)]"
+                }`}
+              />
+              <span className="truncate max-w-[130px]">
+                {tab.session.name || tab.session.host}
+              </span>
+
+              {/* Close button — visible on hover */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  disconnect(tab.id);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                className={`shrink-0 w-4 h-4 flex items-center justify-center rounded-full transition-all hover:!opacity-100 hover:text-[var(--color-danger)] hover:bg-danger/15 ${
+                  isActive
+                    ? "opacity-40 hover:opacity-100"
+                    : "opacity-0 group-hover:opacity-50"
+                }`}
+              >
+                <X size={10} />
+              </button>
+            </div>
+          );
+        })}
+
+        {/* 新建会话 — 浏览器式 + */}
+        <button
+          onClick={openLauncher}
+          onMouseDown={(e) => e.stopPropagation()}
+          title="新建会话 (Ctrl+Shift+T)"
+          aria-label="新建会话"
+          className="no-drag shrink-0 flex items-center justify-center w-8 h-8 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-dim)] transition-colors"
+        >
+          <Plus size={15} />
+        </button>
+      </div>
+
+      {/* SSHFS mount button — per session */}
+      {isSSH && (
+        <div className="no-drag flex items-center flex-shrink-0 ml-2">
+          {currentDrive ? (
+            <button
+              onClick={handleUnmount}
+              disabled={busy !== null}
+              onMouseDown={(e) => e.stopPropagation()}
+              className={"flex items-center gap-1.5 px-2.5 h-8 text-xs rounded-md transition-all disabled:cursor-default " + (busy === "unmount" ? "text-[var(--color-warning)]" : "text-[var(--accent)] hover:bg-[var(--accent-dim)]")}
+            >
+              {busy === "unmount" ? <Loader2 size={14} className="animate-spin" /> : <HardDriveUpload size={14} />}
+              <span className="hidden sm:inline">{busy === "unmount" ? "卸载中…" : `卸载 ${currentDrive}`}</span>
+              {busy !== "unmount" && <span className="sm:hidden">{currentDrive}</span>}
+            </button>
+          ) : (
+            <button
+              onClick={handleMount}
+              disabled={busy !== null}
+              onMouseDown={(e) => e.stopPropagation()}
+              className={"flex items-center gap-1.5 px-2.5 h-8 text-xs rounded-md transition-all disabled:cursor-default " + (busy === "mount" ? "text-[var(--color-warning)]" : "text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-dim)]")}
+            >
+              {busy === "mount" ? <Loader2 size={14} className="animate-spin" /> : <HardDrive size={14} />}
+              <span className="hidden sm:inline">{busy === "mount" ? "挂载中…" : "挂载"}</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Settings */}
+      <button
+        onClick={onSettings}
+        onMouseDown={(e) => e.stopPropagation()}
+        className="no-drag flex items-center justify-center w-9 h-8 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--surface-hover)] transition-colors flex-shrink-0 ml-1"
+        aria-label="Settings"
+      >
+        <Settings size={15} />
+      </button>
+
+          {/* Theme toggle */}
+          <button
+            onClick={toggleTheme}
+            className="no-drag flex items-center justify-center w-9 h-8 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-dim)] transition-colors flex-shrink-0"
+            title={`切换到${THEME_LABELS[nextTheme]}`}
+          >
+            {themeIcon}
+          </button>
+
+      {/* Window controls */}
+      <div className="no-drag flex h-full flex-shrink-0 ml-1">
+        <button
+          onClick={minimize}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="flex h-full w-12 items-center justify-center text-[var(--text-secondary)] hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)] transition-colors"
+          aria-label="Minimize"
+        >
+          <Minus size={16} />
+        </button>
+        <button
+          onClick={toggleMaximize}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="flex h-full w-12 items-center justify-center text-[var(--text-secondary)] hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)] transition-colors"
+          aria-label={maximized ? "还原" : "最大化"}
+          title={maximized ? "还原" : "最大化"}
+        >
+          {maximized ? <Copy size={13} /> : <Square size={13} />}
+        </button>
+        <button
+          onClick={close}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="flex h-full w-12 items-center justify-center text-[var(--text-secondary)] hover:bg-[var(--color-danger)] hover:text-white transition-colors"
+          aria-label="Close"
+        >
+          <X size={16} />
+        </button>
+      </div>
+    </header>
+  );
+}
