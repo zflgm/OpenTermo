@@ -32,6 +32,7 @@ pub struct SystemSampler {
     last_rx_total: u64,
     last_tx_total: u64,
     last_instant: std::time::Instant,
+    last_disks_refresh: std::time::Instant,
 }
 
 impl SystemSampler {
@@ -48,6 +49,7 @@ impl SystemSampler {
             last_rx_total,
             last_tx_total,
             last_instant: std::time::Instant::now(),
+            last_disks_refresh: std::time::Instant::now(),
         }
     }
 
@@ -56,12 +58,12 @@ impl SystemSampler {
         self.sys.refresh_memory();
         self.nets.refresh(true);
 
-        let cpu_percent = self.sys.global_cpu_usage() / 100.0;
+        let cpu_percent = self.sys.global_cpu_usage();
 
         let mem_total = self.sys.total_memory();
         let mem_used = self.sys.used_memory();
         let mem_percent = if mem_total > 0 {
-            mem_used as f32 / mem_total as f32
+            mem_used as f32 / mem_total as f32 * 100.0
         } else {
             0.0
         };
@@ -69,7 +71,7 @@ impl SystemSampler {
         let swap_total = self.sys.total_swap();
         let swap_used = self.sys.used_swap();
         let swap_percent = if swap_total > 0 {
-            swap_used as f32 / swap_total as f32
+            swap_used as f32 / swap_total as f32 * 100.0
         } else {
             0.0
         };
@@ -87,8 +89,12 @@ impl SystemSampler {
         let net_rx_per_sec = (rx_delta as f64 / elapsed) as u64;
         let net_tx_per_sec = (tx_delta as f64 / elapsed) as u64;
 
-        // Local filesystems (slow-changing, but cheap to refresh).
-        self.disks.refresh(true);
+        // Local filesystems change slowly and a full refresh enumerates every
+        // mount, so it runs at most every 30s instead of on every tick.
+        if self.last_disks_refresh.elapsed().as_secs() >= 30 {
+            self.disks.refresh(true);
+            self.last_disks_refresh = std::time::Instant::now();
+        }
         let disks: Vec<(String, u64, u64)> = self
             .disks
             .iter()
