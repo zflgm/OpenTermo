@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use meatshell::command::{CommandEntry, CommandStore};
@@ -167,11 +168,18 @@ pub fn reply_credential(
     prompts.reply_credential(&id, reply)
 }
 
-#[tauri::command]
-pub fn get_system_stats(
-    sampler: State<'_, parking_lot::Mutex<SystemSampler>>,
-) -> SystemSnapshot {
-    sampler.lock().sample()
+// Sampling refreshes every disk and network interface, so it runs on the
+// blocking pool instead of the thread the command would otherwise occupy.
+// Async commands that take a `State` reference must return a `Result`, so the
+// snapshot is wrapped in `Ok`.
+#[tauri::command(async)]
+pub async fn get_system_stats(
+    sampler: State<'_, Arc<parking_lot::Mutex<SystemSampler>>>,
+) -> Result<SystemSnapshot, String> {
+    let sampler = sampler.inner().clone();
+    Ok(tauri::async_runtime::spawn_blocking(move || sampler.lock().sample())
+        .await
+        .unwrap_or_default())
 }
 
 
@@ -276,6 +284,16 @@ fn mount_blocking(
     mounts: &Mutex<HashMap<String, MountInfo>>,
     tab_id: &str,
 ) -> Result<String, String> {
+    // A mount must not begin until the startup sweep has finished: the sweep
+    // matches every `--volname ms_*` process, which includes one this instance
+    // could create while it is still running.
+    for _ in 0..300 {
+        if crate::session::STARTUP_CLEANUP_DONE.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     // Snapshot what we need from the session config.
     let (host, port, user, password_opt, key_path_opt) = {
         let configs = session_configs.lock();

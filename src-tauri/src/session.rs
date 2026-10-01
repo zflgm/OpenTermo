@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::process::Command;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{const_mutex, Mutex};
@@ -55,6 +55,11 @@ static MOUNT_IN_FLIGHT: Mutex<Option<HashMap<String, MountAttempt>>> = const_mut
 
 /// Bumped once per attempt so no two attempts share a config name.
 static MOUNT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Set once the startup sweep of stale rclone processes/configs has finished.
+/// `rclone_mount` waits on this so the sweep can never kill a mount that this
+/// instance created while the sweep was still running.
+pub(crate) static STARTUP_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Reserve `drive` for a mount about to start and mint its config name.
 ///

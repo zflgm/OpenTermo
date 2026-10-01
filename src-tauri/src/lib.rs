@@ -160,16 +160,23 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .manage(SessionManager::new())
-        .manage(parking_lot::Mutex::new(SystemSampler::new()))
+        .manage(Arc::new(parking_lot::Mutex::new(SystemSampler::new())))
         .manage(Arc::new(PromptManager::new()))
         .setup(|app| {
-            // Runs only on the primary instance: a second launch is turned
-            // away inside the single-instance plugin's setup, before this
-            // point. Also still ahead of the window being shown and of any
-            // user input, so nothing this instance spawned can match yet —
-            // every hit is a leftover from a previous run.
-            kill_stale_rclone();
-            clean_stale_rclone_configs();
+            // The stale-rclone sweep is slow (it spawns PowerShell plus a WMI
+            // query over every process, and `clean_stale_rclone_configs` runs
+            // `where rclone`, walks the winget dir, dumps the config and deletes
+            // entries one by one), so it runs on its own thread instead of
+            // blocking the window. It still runs only on the primary instance —
+            // a second launch is turned away inside the single-instance plugin's
+            // setup, before this point. Mounts are gated on the flag it sets, so
+            // the sweep can never kill a mount this instance created while the
+            // sweep was still running.
+            std::thread::spawn(|| {
+                kill_stale_rclone();
+                clean_stale_rclone_configs();
+                session::STARTUP_CLEANUP_DONE.store(true, Ordering::Release);
+            });
 
             let icon_bytes = include_bytes!("../icons/icon.png");
             if let Ok(img) = image::load_from_memory(icon_bytes) {
