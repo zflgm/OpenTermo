@@ -17,7 +17,7 @@ use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::config::{AuthMethod, Session};
+use crate::config::{AuthMethod, Secret, Session};
 use crate::i18n::t;
 
 // ── Legacy-algorithm compatibility ──────────────────────────────────────────
@@ -359,6 +359,17 @@ pub enum SessionEvent {
         need_password: bool,
         responder: CredentialResponder,
     },
+    /// The user checked "remember password" in the credential dialog and the
+    /// credentials just authenticated successfully (#110). The UI layer should
+    /// persist `(user, password)` into the session store so the next connect
+    /// can use them. Emitted only after successful auth — a wrong password is
+    /// never remembered. The password travels as [`Secret`] so it stays
+    /// redacted in `Debug` output.
+    CredentialsRemember {
+        session_id: String,
+        user: String,
+        password: Secret,
+    },
     /// Remote machine resource sample (from the monitor channel).
     /// Memory/swap are in KiB (as reported by /proc/meminfo).
     ResourceStats {
@@ -495,7 +506,12 @@ async fn run_session(
     };
     let addr = format!("{}:{}", session.host, session.port);
     // Connect directly, or tunnel through a SOCKS5 / HTTP proxy (issue #7).
-    let mut handle = match crate::proxy::resolve(&session.proxy) {
+    // A malformed proxy setting fails the connection instead of silently
+    // going direct (fail-closed): the user asked for a proxy, so a direct
+    // connection would violate their intent.
+    let proxy = crate::proxy::resolve(&session.proxy)
+        .with_context(|| format!("invalid proxy for {addr}"))?;
+    let mut handle = match proxy {
         Some(p) => {
             let _ = events.send(SessionEvent::Status(format!(
                 "{} {} → {}",
@@ -516,7 +532,7 @@ async fn run_session(
     };
 
     // Resolve missing username/password by prompting the user (#110).
-    let (user, password) = match resolve_credentials(&session, &events).await {
+    let (user, password, remember) = match resolve_credentials(&session, &events).await {
         Some(c) => c,
         None => {
             let _ = events.send(SessionEvent::Closed(t("已取消登录", "login cancelled").into()));
@@ -572,6 +588,17 @@ async fn run_session(
             .disconnect(Disconnect::ByApplication, "auth failed", "")
             .await;
         return Ok(());
+    }
+
+    // The "remember password" checkbox was checked and these credentials just
+    // authenticated: hand them to the UI layer for persistence (#110). Only
+    // working credentials are ever remembered.
+    if remember {
+        let _ = events.send(SessionEvent::CredentialsRemember {
+            session_id: session.id.clone(),
+            user: user.clone(),
+            password: Secret::new(password.clone()),
+        });
     }
 
     // --- Shell channel --------------------------------------------------
@@ -1237,21 +1264,23 @@ pub(crate) async fn verify_host_key(
 }
 
 /// Resolve a session's username/password, prompting the UI for whatever is
-/// missing (#110). Returns the effective `(user, password)`, or `None` if the
-/// user cancelled. Both the shell and SFTP connections call this; the UI
-/// de-duplicates by session id so a single dialog serves both. A dropped reply
-/// channel (no UI) falls through with the stored values so auth fails normally.
+/// missing (#110). Returns the effective `(user, password, remember)`, where
+/// `remember` is the "remember password" checkbox from the credential dialog
+/// (`false` when no prompt was needed), or `None` if the user cancelled. Both
+/// the shell and SFTP connections call this; the UI de-duplicates by session
+/// id so a single dialog serves both. A dropped reply channel (no UI) falls
+/// through with the stored values so auth fails normally.
 pub(crate) async fn resolve_credentials(
     session: &Session,
     events: &UnboundedSender<SessionEvent>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, bool)> {
     let mut user = session.user.trim().to_string();
     let mut password = session.password.as_str().to_string();
     let need_user = user.is_empty();
     let need_password =
         matches!(session.auth, AuthMethod::Password) && password.is_empty();
     if !(need_user || need_password) {
-        return Some((user, password));
+        return Some((user, password, false));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = events.send(SessionEvent::CredentialPrompt {
@@ -1263,17 +1292,17 @@ pub(crate) async fn resolve_credentials(
         responder: CredentialResponder::new(tx),
     });
     if sent.is_err() {
-        return Some((user, password));
+        return Some((user, password, false));
     }
     match rx.await {
-        Ok(Some((u, p, _remember))) => {
+        Ok(Some((u, p, remember))) => {
             if need_user {
                 user = u.trim().to_string();
             }
             if need_password {
                 password = p;
             }
-            Some((user, password))
+            Some((user, password, remember))
         }
         _ => None,
     }
