@@ -43,8 +43,18 @@ pub fn delete_session(id: String) -> Result<(), String> {
 
 // -- Quick-command snippets --------------------------------------------------
 
+/// Serializes quick-command store access. The store is a single JSON file
+/// written with a plain `fs::write` (no atomic rename) and loaded fresh by
+/// every command: concurrent `delete_command` calls used to interleave
+/// load→remove→save so the last writer silently resurrected entries the
+/// others had deleted, and a `list_commands` racing a save could read a
+/// half-written file. Held only for the short load/mutate/save section of
+/// each command below.
+static CMD_STORE_LOCK: Mutex<()> = parking_lot::const_mutex(());
+
 #[tauri::command]
 pub fn list_commands() -> Result<Vec<CommandEntry>, String> {
+    let _guard = CMD_STORE_LOCK.lock();
     let store = CommandStore::load().map_err(|e| e.to_string())?;
     Ok(store.entries().to_vec())
 }
@@ -62,6 +72,7 @@ fn upsert_entry(store: &mut CommandStore, entry: CommandEntry) -> Result<(), Str
 
 #[tauri::command]
 pub fn save_command(entry: CommandEntry) -> Result<CommandEntry, String> {
+    let _guard = CMD_STORE_LOCK.lock();
     let mut store = CommandStore::load().map_err(|e| e.to_string())?;
     // The store keeps the entry exactly as handed to it, so there is nothing to
     // read back — this used to do a second full load just to echo the entry.
@@ -77,6 +88,7 @@ pub fn save_command(entry: CommandEntry) -> Result<CommandEntry, String> {
 /// file reads plus a write per entry: importing N commands cost 2N reads.
 #[tauri::command]
 pub fn save_commands(entries: Vec<CommandEntry>) -> Result<(), String> {
+    let _guard = CMD_STORE_LOCK.lock();
     let mut store = CommandStore::load().map_err(|e| e.to_string())?;
     for entry in entries {
         upsert_entry(&mut store, entry)?;
@@ -87,6 +99,7 @@ pub fn save_commands(entries: Vec<CommandEntry>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn delete_command(id: String) -> Result<(), String> {
+    let _guard = CMD_STORE_LOCK.lock();
     let mut store = CommandStore::load().map_err(|e| e.to_string())?;
     store.remove(&id);
     store.save().map_err(|e| e.to_string())?;
@@ -127,13 +140,22 @@ pub fn resize_terminal(
     mgr.resize(&tab_id, cols, rows)
 }
 
-// Runs on the async runtime: disconnecting a mounted tab can wait ~1s.
+// Disconnecting a mounted tab blocks on taskkill/WinFsp (~1s), so the body
+// runs on the blocking pool instead of occupying one of the async runtime's
+// worker threads.
 #[tauri::command(async)]
-pub fn disconnect_session(
+pub async fn disconnect_session(
     mgr: State<'_, SessionManager>,
     tab_id: String,
 ) -> Result<(), String> {
-    mgr.disconnect(&tab_id)
+    let mounts = mgr.mounts.clone();
+    let sessions = mgr.sessions.clone();
+    let session_configs = mgr.session_configs.clone();
+    tokio::task::spawn_blocking(move || {
+        SessionManager::disconnect_with(&mounts, &sessions, &session_configs, &tab_id)
+    })
+    .await
+    .map_err(|e| format!("disconnect task failed: {e}"))?
 }
 
 // -- System & interactions ---------------------------------------------------
@@ -177,9 +199,16 @@ pub async fn get_system_stats(
     sampler: State<'_, Arc<parking_lot::Mutex<SystemSampler>>>,
 ) -> Result<SystemSnapshot, String> {
     let sampler = sampler.inner().clone();
-    Ok(tauri::async_runtime::spawn_blocking(move || sampler.lock().sample())
-        .await
-        .unwrap_or_default())
+    match tauri::async_runtime::spawn_blocking(move || sampler.lock().sample()).await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(e) => {
+            // parking_lot mutexes don't poison; the only failure here is the
+            // sampler thread panicking. Log it (lands in error.log) instead of
+            // silently showing an all-zero snapshot.
+            tracing::warn!("system sampler task failed: {e}");
+            Ok(SystemSnapshot::default())
+        }
+    }
 }
 
 
@@ -223,13 +252,18 @@ fn get_occupied_drives() -> std::collections::HashSet<String> {
 }
 
 /// Create a per-session rclone SFTP config entry.
+///
+/// The password is deliberately *not* stored here: it is supplied to the
+/// mount process via the `RCLONE_CONFIG_<name>_PASS` environment variable
+/// (see `mount_blocking`), so it never appears in a process command line —
+/// readable by every local user through WMI/`tasklist` — nor in the rclone
+/// config file on disk.
 fn create_rclone_config(
     rclone_path: &str,
     config_name: &str,
     host: &str,
     port: u16,
     user: &str,
-    password: Option<&str>,
     key_path: Option<&str>,
 ) -> Result<(), String> {
     let mut cmd = Command::new(rclone_path);
@@ -248,16 +282,48 @@ fn create_rclone_config(
         cmd.arg("key_file").arg(&fixed);
     }
 
-    if let Some(pw) = password {
-        cmd.arg("pass").arg(pw);
-    }
-
     let output = cmd.output().map_err(|e| format!("Failed to run rclone config: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("rclone config failed: {}", stderr.trim()));
     }
     Ok(())
+}
+
+/// Obscure `password` with rclone's own `obscure` implementation, feeding the
+/// password through stdin (`rclone obscure -`) so it never appears in a
+/// command line. rclone only accepts the obscured form for password options —
+/// including values supplied via environment variables — and rejects
+/// plaintext with a "is it obscured?" error.
+fn obscure_password(rclone_path: &str, password: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    let mut child = Command::new(rclone_path)
+        .creation_flags(0x08000000)
+        .args(["obscure", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to run rclone obscure: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("rclone obscure stdin unavailable".to_string())?
+        .write_all(format!("{password}\n").as_bytes())
+        .map_err(|e| format!("Failed to feed rclone obscure stdin: {e}"))?;
+    // Close stdin so `obscure` sees EOF after the first line.
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read rclone obscure output: {e}"))?;
+    if !output.status.success() {
+        return Err("rclone obscure failed".into());
+    }
+    let obscured = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if obscured.is_empty() {
+        return Err("rclone obscure produced no output".into());
+    }
+    Ok(obscured)
 }
 
 // Every step of this waits on a child process, so the body runs on a blocking
@@ -351,12 +417,25 @@ fn mount_blocking(
         &host,
         port,
         &user,
-        password_opt.as_ref().map(|s| s.as_str()),
         key_path_opt.as_deref(),
     ) {
         abort_mount(tab_id, &attempt, None);
         return Err(e);
     }
+
+    // Resolve the SFTP password into rclone's obscured form for the mount
+    // process environment (see `obscure_password`). Fail closed: a mount
+    // without a usable password must not start.
+    let obscured_pw: Option<String> = match password_opt.as_ref().map(|s| s.as_str()) {
+        Some(pw) => match obscure_password(crate::get_rclone_path(), pw) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                abort_mount(tab_id, &attempt, None);
+                return Err(e);
+            }
+        },
+        None => None,
+    };
 
     // Spawn rclone mount as background process
     let mut cmd = Command::new(crate::get_rclone_path());
@@ -367,6 +446,17 @@ fn mount_blocking(
         .arg("--no-check-certificate")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+
+    // The password reaches rclone through a per-remote environment variable,
+    // which outranks the config file. A child process environment — unlike
+    // its command line — is not readable by other local users (WMI/`tasklist`
+    // expose only the command line).
+    if let Some(o) = obscured_pw {
+        cmd.env(
+            format!("RCLONE_CONFIG_{}_PASS", attempt.config_name.to_uppercase()),
+            o,
+        );
+    }
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,

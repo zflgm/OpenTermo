@@ -11,7 +11,7 @@ use std::sync::Arc;
 use parking_lot::{const_mutex, Mutex};
 use tauri::{AppHandle, Emitter};
 
-use meatshell::config::{Session as SessionConfig, SessionKind};
+use meatshell::config::{ConfigStore, Session as SessionConfig, SessionKind};
 use meatshell::serial::spawn_serial_session;
 use meatshell::ssh::{self, SessionCommand, SessionEvent, SessionHandle};
 use meatshell::telnet::spawn_telnet_session;
@@ -263,9 +263,10 @@ impl SessionManager {
         // Spawn a task that forwards SessionEvents to Tauri events
         let sessions = self.sessions.clone();
         let mounts = self.mounts.clone();
+        let session_configs = self.session_configs.clone();
         let tid = tab_id_owned.clone();
         self.runtime.spawn(async move {
-            forward_events(app, sessions, mounts, tid, rx, prompts).await;
+            forward_events(app, sessions, mounts, session_configs, tid, rx, prompts).await;
         });
 
         Ok(())
@@ -296,18 +297,36 @@ impl SessionManager {
 
     /// Disconnect and remove a session.
     pub fn disconnect(&self, tab_id: &str) -> Result<(), String> {
+        Self::disconnect_with(
+            &self.mounts,
+            &self.sessions,
+            &self.session_configs,
+            tab_id,
+        )
+    }
+
+    /// Blocking body of [`Self::disconnect`], callable without a `&self` so
+    /// Tauri commands can run it on the blocking pool (`disconnect_session`).
+    /// Unmounting waits on `taskkill` and WinFsp (~1s); that must not occupy
+    /// an async runtime worker thread.
+    pub(crate) fn disconnect_with(
+        mounts: &Mutex<HashMap<String, MountInfo>>,
+        sessions: &Mutex<HashMap<String, SessionHandle>>,
+        session_configs: &Mutex<HashMap<String, SessionConfig>>,
+        tab_id: &str,
+    ) -> Result<(), String> {
         // Serialize with mount/unmount; `unmount_locked` also cancels a mount
         // for this tab that is still coming up, so a half-finished mount never
         // outlives its tab.
         let _op = MOUNT_OP.lock();
         // Unmount rclone if mounted for this tab
-        unmount_locked(&self.mounts, tab_id);
+        unmount_locked(mounts, tab_id);
         // Close terminal session
-        let mut sessions = self.sessions.lock();
+        let mut sessions = sessions.lock();
         if let Some(handle) = sessions.remove(tab_id) {
             let _ = handle.commands.send(SessionCommand::Close);
         }
-        self.session_configs.lock().remove(tab_id);
+        session_configs.lock().remove(tab_id);
         Ok(())
     }
 
@@ -350,6 +369,7 @@ async fn forward_events(
     app: AppHandle,
     sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
     mounts: Arc<Mutex<HashMap<String, MountInfo>>>,
+    session_configs: Arc<Mutex<HashMap<String, SessionConfig>>>,
     tab_id: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     prompts: Arc<PromptManager>,
@@ -426,19 +446,104 @@ async fn forward_events(
                 cpu_percent,
                 mem_used_kib,
                 mem_total_kib,
-                ..
+                swap_used_kib,
+                swap_total_kib,
+                net,
+                disks,
+                procs,
             } => {
+                // Forward the full sample: the kernel already pays the
+                // collection cost (`ps` + `/proc` parsing every round), so
+                // projecting fields away here only wastes it. The UI consumes
+                // what it needs; the rest is available for future panels.
                 let _ = app.emit(
                     &format!("remote-stats:{tab_id}"),
                     serde_json::json!({
                         "cpu_percent": cpu_percent,
                         "mem_used_kib": mem_used_kib,
                         "mem_total_kib": mem_total_kib,
+                        "swap_used_kib": swap_used_kib,
+                        "swap_total_kib": swap_total_kib,
+                        "net": net.iter().map(|(name, rx_bps, tx_bps)| serde_json::json!({
+                            "name": name,
+                            "rx_bytes_per_sec": rx_bps,
+                            "tx_bytes_per_sec": tx_bps,
+                        })).collect::<Vec<_>>(),
+                        "disks": disks.iter().map(|(mount_point, available_bytes, total_bytes)| serde_json::json!({
+                            "mount_point": mount_point,
+                            "available_bytes": available_bytes,
+                            "total_bytes": total_bytes,
+                        })).collect::<Vec<_>>(),
+                        "procs": procs.iter().map(|p| serde_json::json!({
+                            "pid": p.pid,
+                            "user": p.user,
+                            "cpu": p.cpu,
+                            "mem": p.mem,
+                            "command": p.command,
+                        })).collect::<Vec<_>>(),
                     }),
                 );
             }
             SessionEvent::CwdChanged(path) => {
                 let _ = app.emit(&format!("terminal-cwd:{tab_id}"), path);
+            }
+            SessionEvent::CredentialsRemember {
+                session_id,
+                user,
+                password,
+            } => {
+                // "Remember password" was checked in the credential dialog and
+                // the credentials just authenticated (#110): persist them into
+                // the encrypted session store so the next connect reuses them.
+                // The in-memory copy is updated first, so an rclone mount
+                // started later in this run uses the remembered password too.
+                if let Some(cfg) = session_configs.lock().get_mut(&tab_id) {
+                    cfg.user = user.clone();
+                    cfg.password = password.clone();
+                }
+                // Disk I/O goes to the blocking pool, not this task.
+                // `tab_id` is borrowed by later loop iterations, so the
+                // closure gets its own clone.
+                let app = app.clone();
+                let tab_id_for_emit = tab_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut store = match ConfigStore::load() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                "remember password: cannot load session store: {e:#}"
+                            );
+                            return;
+                        }
+                    };
+                    let Some(entry) =
+                        store.sessions_mut().iter_mut().find(|s| s.id == session_id)
+                    else {
+                        // The session was deleted while connecting; nothing to
+                        // persist to.
+                        return;
+                    };
+                    entry.user = user.clone();
+                    entry.password = password.clone();
+                    if let Err(e) = store.save() {
+                        tracing::warn!(
+                            "remember password: cannot save session store: {e:#}"
+                        );
+                        return;
+                    }
+                    // Tell the UI to merge the remembered credentials into its
+                    // session list (surgical update — a full reload could
+                    // clobber unsaved edits in an open dialog).
+                    let _ = app.emit(
+                        "credentials-remembered",
+                        serde_json::json!({
+                            "tab_id": tab_id_for_emit,
+                            "session_id": session_id,
+                            "user": user,
+                            "password": password.as_str(),
+                        }),
+                    );
+                });
             }
             // ── Kernel events this layer does not forward ─────────────────
             // Spelled out variant by variant rather than `_ => {}`: a wildcard
