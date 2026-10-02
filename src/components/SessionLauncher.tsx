@@ -347,7 +347,11 @@ export default function SessionLauncher() {
   // ── 分组排序 ───────────────────────────────────────────────────────────
 
   /** 屏幕上可挪动的分组（Default 永远置顶，不参与排序）。 */
-  const movableNames = groups.map((g) => g.name).filter((n) => n !== RESERVED_GROUP);
+  // 可排序的分组：沿用 sessionGroups 的单一实现（排除置顶的 Default）
+  const movableNames = movableGroups(
+    groups.map((g) => g.name),
+    knownGroups,
+  );
 
   /** 上移 / 下移：与相邻分组换位置。挪动过的未登记组一并落进名册，位置才算数。 */
   const moveGroup = (name: string, delta: -1 | 1) => {

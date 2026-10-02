@@ -596,7 +596,9 @@ export default function TerminalView({ tabId, active }: { tabId: string; active:
     const term = terminalRef.current;
     if (!term) return;
     try { fitAddonRef.current?.fit(); } catch {}
-    if (term.cols > 0 && term.rows > 0) onResize(tabId, term.cols, term.rows);
+    // Matches the .catch(() => {}) style of the resize subscription above:
+    // the backend drops resizes for sessions that don't exist (yet).
+    if (term.cols > 0 && term.rows > 0) onResize(tabId, term.cols, term.rows).catch(() => {});
   }, [tabStatus, tabId, onResize]);
 
   // navigation in history dropdown ───────────────────
