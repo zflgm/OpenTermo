@@ -2,7 +2,7 @@
 
 > A lightweight, multi-protocol terminal client. Built with Tauri 2 + React + Rust.
 
-OpenTermo is a desktop SSH / SFTP / Telnet / Serial client with a modern glass-morphism UI.  
+OpenTermo is a desktop SSH / Telnet / Serial client with a modern glass-morphism UI.  
 It is based on [meatshell](https://github.com/jeff141/meatshell), an open-source Rust SSH backend created by [一坨肉 (jeff141)](https://github.com/jeff141).
 
 ## Relationship with meatshell
@@ -17,7 +17,7 @@ This project borrows the meatshell/ Rust library as its terminal backend, and bu
 ## Features
 
 - **SSH** — password, private key, encrypted key (passphrase)
-- **SFTP** — browse, upload, download
+- **Remote file access** — mount remote directories locally via rclone (needs rclone installed)
 - **Telnet / Serial** — full support
 - **Port forwarding** — local (-L), remote (-R), dynamic (-D, SOCKS5)
 - **ZMODEM** — receive files from sz

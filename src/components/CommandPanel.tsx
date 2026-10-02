@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { useCommandStore } from "@/stores/commandStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { refocusTerminal } from "@/lib/terminal";
 import { save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandEntry } from "@/lib/tauriCommands";
@@ -318,9 +319,7 @@ export default function CommandPanel() {
       await upsert(updated);
       await sendInput(activeTabId, resolved);
       triggerScroll(activeTabId);
-      setTimeout(() => {
-        document.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus();
-      }, 50);
+      refocusTerminal();
     },
     [activeTabId, activeTab, upsert, sendInput],
   );
@@ -334,9 +333,7 @@ export default function CommandPanel() {
       // Send command + Enter to execute immediately
       await sendInput(activeTabId, resolved + "\r");
       triggerScroll(activeTabId);
-      setTimeout(() => {
-        document.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus();
-      }, 50);
+      refocusTerminal();
     },
     [activeTabId, activeTab, upsert, sendInput],
   );
@@ -348,7 +345,7 @@ export default function CommandPanel() {
         clearTimeout(clickTimerRef.current);
         clickTimerRef.current = null;
         pendingCmdRef.current = null;
-        handleExecute(cmd);
+        handleExecute(cmd).catch(() => {});
       } else {
         // First click -> wait 300ms for possible second click
         pendingCmdRef.current = cmd;
@@ -356,7 +353,7 @@ export default function CommandPanel() {
           clickTimerRef.current = null;
           const pending = pendingCmdRef.current;
           pendingCmdRef.current = null;
-          if (pending) handleSend(pending);
+          if (pending) handleSend(pending).catch(() => {});
         }, 300);
       }
     },
@@ -552,7 +549,18 @@ export default function CommandPanel() {
                 ...n.commands.map((c) => c.id),
                 ...n.children.flatMap(collectIds),
               ];
-              collectIds(node).forEach((id) => remove(id));
+              // Serial deletes: the backend store is a single JSON file, and
+              // concurrent delete_command calls used to interleave
+              // load→remove→save so the last writer silently resurrected
+              // entries the others had deleted. Per-id catch keeps one failure
+              // from aborting the rest.
+              for (const id of collectIds(node)) {
+                try {
+                  await remove(id);
+                } catch (e) {
+                  console.error(`[commands] failed to delete ${id}:`, e);
+                }
+              }
               removeEmptyFolder(node.path);
             }
           },
