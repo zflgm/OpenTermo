@@ -250,7 +250,6 @@ export function applyTheme({
 
   // ── Terminal canvas ──────────────────────────────────────────────────────
   r.setProperty("--term-bg-rgb", rgbTriplet(p.termBg));
-  r.setProperty("--term-fg", p.termFg);
   r.setProperty("--term-alpha", String(round2(terminalAlpha)));
 }
 

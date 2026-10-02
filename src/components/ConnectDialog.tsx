@@ -116,11 +116,6 @@ export default function ConnectDialog({
     }
   };
 
-  const handleSelectSession = (s: SessionConfig) => {
-    onConnect(s);
-    onClose();
-  };
-
   const handleBrowseKey = async () => {
     try {
       const selected = await open({

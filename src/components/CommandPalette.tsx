@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { Search, CornerDownLeft } from "lucide-react";
 import { useCommandStore } from "@/stores/commandStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { refocusTerminal } from "@/lib/terminal";
 import { resolveCommandTemplate } from "@/lib/utils";
 import type { CommandEntry } from "@/lib/tauriCommands";
 
@@ -63,12 +64,10 @@ export default function CommandPalette() {
     (entry: CommandEntry) => {
       if (!activeTabId) return;
       const resolved = resolveCommandTemplate(entry.command, activeTab?.session);
-      sendInput(activeTabId, resolved + "\r");
+      sendInput(activeTabId, resolved + "\r").catch(() => {});
       triggerScroll(activeTabId);
       setOpen(false);
-      setTimeout(() => {
-        document.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus();
-      }, 50);
+      refocusTerminal();
     },
     [activeTabId, activeTab, sendInput],
   );
@@ -84,6 +83,10 @@ export default function CommandPalette() {
       e.preventDefault();
       if (results[selectedIdx]) execute(results[selectedIdx]);
     } else if (e.key === "Escape") {
+      // Don't let the palette's Esc bubble to the window handler in
+      // SessionLauncher, which would also close the launcher (Ctrl+K while
+      // the launcher is open closes both otherwise).
+      e.stopPropagation();
       setOpen(false);
     }
   };

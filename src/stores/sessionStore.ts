@@ -25,11 +25,32 @@ type ConnectionStatus = "disconnected" | "connecting" | "connected";
  */
 let lastGrid: { cols: number; rows: number } | null = null;
 
+/**
+ * Tauri event unlisten functions: `${tabId}-${kind}` for per-tab listeners,
+ * `global-*` for app-wide ones. Kept outside the store because it is mutated
+ * directly without `set()` — nothing renders from it — and a module-level Map
+ * makes that honest instead of hiding a mutable inside zustand state.
+ */
+const unlisteners = new Map<string, UnlistenFn>();
+
 /** Remote resource stats pushed by the SSH session. */
 interface RemoteStats {
   cpu_percent: number;
   mem_used_kib: number;
   mem_total_kib: number;
+  swap_used_kib: number;
+  swap_total_kib: number;
+  net: { name: string; rx_bytes_per_sec: number; tx_bytes_per_sec: number }[];
+  disks: { mount_point: string; available_bytes: number; total_bytes: number }[];
+  procs: { pid: number; user: string; cpu: number; mem: number; command: string }[];
+}
+
+/** Emitted by the backend after a "remember password" credential authenticates. */
+interface CredentialsRememberedPayload {
+  tab_id: string;
+  session_id: string;
+  user: string;
+  password: string;
 }
 
 export interface ActiveTab {
@@ -94,8 +115,8 @@ interface SessionState {
   dismissHostKey: () => void;
   dismissCredential: () => void;
 
-  // Internal event listener registry
-  _unlisteners: Map<string, UnlistenFn>;
+  // Internal event listener wiring (registration state lives in the
+  // module-level `unlisteners` map above, not in zustand state).
   _setupListener: (tabId: string) => Promise<void>;
   _teardownListener: (tabId: string) => Promise<void>;
   _setupGlobalListeners: () => Promise<void>;
@@ -113,7 +134,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   lastError: null,
   lastInfo: null,
   scrollTrigger: {},
-  _unlisteners: new Map(),
 
   // ── Session CRUD ───────────────────────────────────────────────────────
 
@@ -154,6 +174,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async connect(tabId, session) {
+    // One tab id maps to exactly one backend session: re-connecting an
+    // existing tab (e.g. double-clicking "connect" in the dialog) used to
+    // invoke connect_session twice on the same id. Just focus it instead.
+    if (get().tabs.some((t) => t.id === tabId)) {
+      set({ activeTabId: tabId });
+      return;
+    }
     // Ensure the tab exists
     set((s) => {
       const exists = s.tabs.find((t) => t.id === tabId);
@@ -166,8 +193,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         activeTabId: tabId,
       };
     });
-    await get()._setupListener(tabId);
     try {
+      await get()._setupListener(tabId);
       await connectSession(tabId, session, lastGrid?.cols ?? 80, lastGrid?.rows ?? 24);
     } catch (err) {
       const msg = String(err);
@@ -183,7 +210,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async disconnect(tabId) {
-    await disconnectSession(tabId);
+    // Best-effort: the tab is going away regardless, and none of the callers
+    // catch — a backend error here must not become an unhandled rejection.
+    try {
+      await disconnectSession(tabId);
+    } catch (e) {
+      console.error(`[session] disconnect ${tabId} failed:`, e);
+    }
     await get()._teardownListener(tabId);
     // Answer any prompts still queued for this tab; otherwise the backend
     // connect task stays blocked on the reply channel forever.
@@ -251,108 +284,175 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   // ── Event listeners ───────────────────────────────────────────────────
 
   async _setupListener(tabId) {
-    if (get()._unlisteners.has(`${tabId}-output`)) return;
-
-    const unlistenOutput = await listen<string>(
-      `terminal-output:${tabId}`,
-      (event) => {
-        window.dispatchEvent(
-          new CustomEvent(`terminal-data:${tabId}`, { detail: event.payload }),
-        );
-      },
+    const keys = ["output", "connected", "closed", "status", "remotestats"].map(
+      (s) => `${tabId}-${s}`,
     );
+    if (keys.some((k) => unlisteners.has(k))) return;
+    // Occupy the keys *before* the first await with a per-call sentinel: a
+    // second concurrent setup sees the reservation and backs off, a teardown
+    // racing us deletes it (detected when filling below), and a failed
+    // registration rolls everything back instead of leaking.
+    const pending: UnlistenFn = () => {};
+    for (const k of keys) unlisteners.set(k, pending);
 
-    const unlistenConnected = await listen<boolean>(
-      `terminal-connected:${tabId}`,
-      () => {
-        set((s) => ({
-          tabs: s.tabs.map((t) =>
-            t.id === tabId ? { ...t, status: "connected", statusText: "已连接" } : t,
-          ),
-        }));
-      },
-    );
+    const fns: UnlistenFn[] = [];
+    try {
+      fns.push(
+        await listen<string>(`terminal-output:${tabId}`, (event) => {
+          window.dispatchEvent(
+            new CustomEvent(`terminal-data:${tabId}`, { detail: event.payload }),
+          );
+        }),
+      );
+      fns.push(
+        await listen<boolean>(`terminal-connected:${tabId}`, () => {
+          set((s) => ({
+            tabs: s.tabs.map((t) =>
+              t.id === tabId ? { ...t, status: "connected", statusText: "已连接" } : t,
+            ),
+          }));
+        }),
+      );
+      fns.push(
+        await listen<string>(`terminal-closed:${tabId}`, async (event) => {
+          const tab = get().tabs.find((t) => t.id === tabId);
+          // If tab was still connecting, show error
+          if (tab && tab.status === "connecting") {
+            set({ lastError: `连接失败: ${event.payload}` });
+            setTimeout(() => set({ lastError: null }), 6000);
+          }
 
-    const unlistenClosed = await listen<string>(
-      `terminal-closed:${tabId}`,
-      async (event) => {
-        const tab = get().tabs.find((t) => t.id === tabId);
-        // If tab was still connecting, show error
-        if (tab && tab.status === "connecting") {
-          set({ lastError: `连接失败: ${event.payload}` });
-          setTimeout(() => set({ lastError: null }), 6000);
+          await get()._teardownListener(tabId);
+          set((s) => ({
+            tabs: s.tabs.filter((t) => t.id !== tabId),
+            activeTabId: s.activeTabId === tabId ? null : s.activeTabId,
+            hostKeyPrompts: s.hostKeyPrompts.filter((p) => p.tab_id !== tabId),
+            credentialPrompts: s.credentialPrompts.filter((p) => p.tab_id !== tabId),
+          }));
+        }),
+      );
+      fns.push(
+        await listen<string>(`terminal-status:${tabId}`, (event) => {
+          set((s) => ({
+            tabs: s.tabs.map((t) =>
+              t.id === tabId ? { ...t, status: "connected", statusText: event.payload } : t,
+            ),
+          }));
+        }),
+      );
+      // ── Remote resource stats (SSH) ────────────────────────────────────
+      fns.push(
+        await listen<RemoteStats>(`remote-stats:${tabId}`, (event) => {
+          set((s) => ({
+            tabs: s.tabs.map((t) =>
+              t.id === tabId ? { ...t, remoteStats: event.payload } : t,
+            ),
+          }));
+        }),
+      );
+    } catch (e) {
+      // A registration failed: release the ones that succeeded and give up
+      // the reservations so a later retry starts clean.
+      for (const fn of fns) {
+        try {
+          fn();
+        } catch {
+          /* already released */
         }
+      }
+      for (const k of keys) {
+        if (unlisteners.get(k) === pending) unlisteners.delete(k);
+      }
+      throw e;
+    }
 
-        await get()._teardownListener(tabId);
-        set((s) => ({
-          tabs: s.tabs.filter((t) => t.id !== tabId),
-          activeTabId: s.activeTabId === tabId ? null : s.activeTabId,
-          hostKeyPrompts: s.hostKeyPrompts.filter((p) => p.tab_id !== tabId),
-          credentialPrompts: s.credentialPrompts.filter((p) => p.tab_id !== tabId),
-        }));
-      },
-    );
-
-    const unlistenStatus = await listen<string>(
-      `terminal-status:${tabId}`,
-      (event) => {
-        set((s) => ({
-          tabs: s.tabs.map((t) =>
-            t.id === tabId ? { ...t, status: "connected", statusText: event.payload } : t,
-          ),
-        }));
-      },
-    );
-
-    // ── Remote resource stats (SSH) ────────────────────────────────────
-    const unlistenRemoteStats = await listen<RemoteStats>(
-      `remote-stats:${tabId}`,
-      (event) => {
-        set((s) => ({
-          tabs: s.tabs.map((t) =>
-            t.id === tabId ? { ...t, remoteStats: event.payload } : t,
-          ),
-        }));
-      },
-    );
-
-    const ul = get()._unlisteners;
-    ul.set(`${tabId}-output`, unlistenOutput);
-    ul.set(`${tabId}-connected`, unlistenConnected);
-    ul.set(`${tabId}-closed`, unlistenClosed);
-    ul.set(`${tabId}-status`, unlistenStatus);
-    ul.set(`${tabId}-remotestats`, unlistenRemoteStats);
+    // Fill the reservations. If a teardown raced us, our sentinel is gone —
+    // drop the listener immediately instead of leaking it.
+    keys.forEach((k, i) => {
+      if (unlisteners.get(k) === pending) {
+        unlisteners.set(k, fns[i]);
+      } else {
+        try {
+          fns[i]();
+        } catch {
+          /* already released */
+        }
+      }
+    });
   },
 
   async _teardownListener(tabId) {
-    const ul = get()._unlisteners;
     for (const suffix of ["output", "connected", "closed", "status", "remotestats"]) {
       const key = `${tabId}-${suffix}`;
-      const fn = ul.get(key);
+      const fn = unlisteners.get(key);
       if (fn) {
-        fn();
-        ul.delete(key);
+        try {
+          fn();
+        } catch {
+          /* already released */
+        }
+        unlisteners.delete(key);
       }
     }
   },
 
   async _setupGlobalListeners() {
-    // Only need to set up once
-    const ul = get()._unlisteners;
-    if (ul.has("global-host-key")) return;
+    // Only need to set up once. Reserving the keys before the first await
+    // also keeps React StrictMode's double-invoked effect (dev only) from
+    // registering every global listener twice.
+    const keys = ["global-host-key", "global-credential", "global-remembered"];
+    if (keys.some((k) => unlisteners.has(k))) return;
+    const pending: UnlistenFn = () => {};
+    for (const k of keys) unlisteners.set(k, pending);
 
-    const unlistenHostKey = await listen<HostKeyPromptPayload>(
-      "host-key-prompt",
-      (event) => set((s) => ({ hostKeyPrompts: [...s.hostKeyPrompts, event.payload] })),
-    );
-
-    const unlistenCredential = await listen<CredentialPromptPayload>(
-      "credential-prompt",
-      (event) => set((s) => ({ credentialPrompts: [...s.credentialPrompts, event.payload] })),
-    );
-
-    ul.set("global-host-key", unlistenHostKey);
-    ul.set("global-credential", unlistenCredential);
+    const fns: UnlistenFn[] = [];
+    try {
+      fns.push(
+        await listen<HostKeyPromptPayload>("host-key-prompt", (event) =>
+          set((s) => ({ hostKeyPrompts: [...s.hostKeyPrompts, event.payload] })),
+        ),
+      );
+      fns.push(
+        await listen<CredentialPromptPayload>("credential-prompt", (event) =>
+          set((s) => ({ credentialPrompts: [...s.credentialPrompts, event.payload] })),
+        ),
+      );
+      fns.push(
+        await listen<CredentialsRememberedPayload>("credentials-remembered", (event) => {
+          const { session_id, user, password } = event.payload;
+          // Surgical merge: a full loadSessions() here could clobber unsaved
+          // edits in an open dialog.
+          set((s) => ({
+            sessions: s.sessions.map((sess) =>
+              sess.id === session_id ? { ...sess, user, password } : sess,
+            ),
+          }));
+        }),
+      );
+    } catch (e) {
+      for (const fn of fns) {
+        try {
+          fn();
+        } catch {
+          /* already released */
+        }
+      }
+      for (const k of keys) {
+        if (unlisteners.get(k) === pending) unlisteners.delete(k);
+      }
+      throw e;
+    }
+    keys.forEach((k, i) => {
+      if (unlisteners.get(k) === pending) {
+        unlisteners.set(k, fns[i]);
+      } else {
+        try {
+          fns[i]();
+        } catch {
+          /* already released */
+        }
+      }
+    });
   },
 }));
 

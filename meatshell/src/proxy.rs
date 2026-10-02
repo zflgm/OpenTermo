@@ -49,21 +49,31 @@ impl std::fmt::Debug for ProxyConfig {
 }
 
 /// Resolve the proxy for a session: the explicit `session_proxy` string if set,
-/// otherwise the `ALL_PROXY` / `all_proxy` environment variable.  Returns `None`
-/// for a direct connection.
-pub fn resolve(session_proxy: &str) -> Option<ProxyConfig> {
+/// otherwise the `ALL_PROXY` / `all_proxy` environment variable.
+///
+/// Returns `Ok(None)` when no proxy is configured (direct connection is
+/// intended). A proxy that *is* configured but malformed is an `Err` —
+/// failing closed: a typo like `socks5://proxy:abc` must never silently bypass
+/// the proxy and connect directly, which would expose traffic the user
+/// expected to be proxied.
+pub fn resolve(session_proxy: &str) -> Result<Option<ProxyConfig>> {
     let s = session_proxy.trim();
     if !s.is_empty() {
-        return parse(s);
+        return parse(s)
+            .map(Some)
+            .with_context(|| format!("invalid proxy URL in session setting: {s:?}"));
     }
     for var in ["ALL_PROXY", "all_proxy"] {
         if let Ok(v) = std::env::var(var) {
-            if !v.trim().is_empty() {
-                return parse(v.trim());
+            let v = v.trim();
+            if !v.is_empty() {
+                return parse(v).map(Some).with_context(|| {
+                    format!("invalid proxy URL in {var} environment variable: {v:?}")
+                });
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Parse a proxy URL: `scheme://[user:pass@]host:port`.

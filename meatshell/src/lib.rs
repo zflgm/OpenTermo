@@ -1,6 +1,6 @@
 //! meatshell — a lightweight SSH/terminal client backend library.
 //!
-//! Pure Rust backend for SSH, SFTP, Telnet, Serial, proxy, ZMODEM,
+//! Pure Rust backend for SSH, Telnet, Serial, proxy, ZMODEM,
 //! configuration management, system monitoring and host-key verification.
 //! Designed to be used as a library by Tauri or other frontend frameworks.
 

@@ -107,7 +107,10 @@ async fn run_telnet(
     )));
 
     // Direct, or tunnel through a SOCKS5 / HTTP proxy (reuses issue #7 plumbing).
-    let stream = match crate::proxy::resolve(&session.proxy) {
+    // Fail closed on a malformed proxy setting: never silently go direct.
+    let proxy = crate::proxy::resolve(&session.proxy)
+        .with_context(|| format!("invalid proxy for {addr}"))?;
+    let stream = match proxy {
         Some(p) => {
             let _ = events.send(SessionEvent::Status(format!(
                 "{} {} → {}",
